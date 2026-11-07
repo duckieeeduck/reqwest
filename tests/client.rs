@@ -354,6 +354,30 @@ async fn overridden_dns_resolution_with_hickory_dns_multiple() {
     assert_eq!("Hello", text);
 }
 
+#[cfg(feature = "hickory-dns")]
+#[tokio::test]
+#[ignore]
+async fn hickory_dns_resolves_hosts_file_entry() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let server = server::http(move |_req| async { http::Response::new("Hello".into()) });
+
+    let url = format!(
+        "http://reqwest-hosts-test.example:{}/hosts_file",
+        server.addr().port()
+    );
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .hickory_dns(true)
+        .build()
+        .expect("client builder");
+    let req = client.get(&url);
+    let res = req.send().await.expect("request");
+
+    assert_eq!(res.status(), reqwest::StatusCode::OK);
+    let text = res.text().await.expect("Failed to get text");
+    assert_eq!("Hello", text);
+}
+
 #[cfg(any(feature = "__native-tls", feature = "__rustls",))]
 #[test]
 fn use_preconfigured_tls_with_bogus_backend() {
