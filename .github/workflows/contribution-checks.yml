@@ -1,0 +1,424 @@
+name: Contribution checks
+# Fork-only. Mirrors upstream .github/workflows/ci.yml jobs (style, test matrix,
+# features, unstable, docs, nightly, msrv, android, wasm) without the `needs`
+# chain, so every job and step runs even after an earlier failure. nextest
+# uses --no-fail-fast so one run shows every failing test. The regression job
+# runs the ignored hosts-file test twice: with the runner's system DNS config,
+# and with an empty /etc/resolv.conf so reqwest takes its fallback path.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Contribution branch or commit to check
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  REQWEST_TEST_BODY_FULL: 1
+  RUST_BACKTRACE: 1
+  CARGO_INCREMENTAL: 0
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+
+jobs:
+  regression:
+    name: Regression (hickory-dns hosts file)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - name: Install rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Show commit
+        run: git rev-parse HEAD
+      - name: Create Cargo.lock
+        run: cargo update
+      - name: Build regression test binary
+        run: |
+          cargo test --locked --features hickory-dns --test client --no-run --message-format=json \
+            | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .target.name == "client") | .executable' \
+            > "$RUNNER_TEMP/client-bin"
+          cat "$RUNNER_TEMP/client-bin"
+          test -x "$(cat "$RUNNER_TEMP/client-bin")"
+      - name: Add hosts file entry
+        run: |
+          echo "127.0.0.1 reqwest-hosts-test.example" | sudo tee -a /etc/hosts
+          cat /etc/hosts
+      - name: Regression test, system DNS config
+        if: ${{ !cancelled() }}
+        run: |
+          ls -l /etc/resolv.conf
+          grep -v '^#' /etc/resolv.conf || true
+          RUST_LOG=reqwest=debug "$(cat "$RUNNER_TEMP/client-bin")" hickory_dns_resolves_hosts_file_entry \
+            --exact --ignored --nocapture 2>&1 | tee "$RUNNER_TEMP/system.log"
+          if grep -q "falling back to Google DNS" "$RUNNER_TEMP/system.log"; then
+            echo "::error::fallback path was taken although the system config is valid"
+            exit 1
+          fi
+      - name: Regression test, fallback DNS config
+        if: ${{ !cancelled() }}
+        run: |
+          sudo mv /etc/resolv.conf /etc/resolv.conf.orig
+          sudo touch /etc/resolv.conf
+          ls -l /etc/resolv.conf
+          status=0
+          start=$(date +%s)
+          RUST_LOG=reqwest=debug "$(cat "$RUNNER_TEMP/client-bin")" hickory_dns_resolves_hosts_file_entry \
+            --exact --ignored --nocapture 2>&1 | tee "$RUNNER_TEMP/fallback.log" || status=$?
+          echo "elapsed seconds: $(( $(date +%s) - start ))"
+          sudo rm /etc/resolv.conf
+          sudo mv /etc/resolv.conf.orig /etc/resolv.conf
+          if ! grep -q "falling back to Google DNS" "$RUNNER_TEMP/fallback.log"; then
+            echo "::error::fallback path was not taken, so this step proves nothing"
+            exit 1
+          fi
+          exit $status
+
+  style:
+    name: Check Style
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - name: Install rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: cargo fmt -- --check
+        if: ${{ !cancelled() }}
+        run: cargo fmt -- --check
+      - name: temporary workaround - fmt all files under src
+        if: ${{ !cancelled() }}
+        run: cargo fmt -- --check $(find . -name '*.rs' -print)
+
+  test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os || 'ubuntu-latest' }}
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: ${{ matrix.aws_lc_sys_prebuilt_nasm || 0 }}
+    strategy:
+      fail-fast: false
+      matrix:
+        name:
+          - linux / stable
+          - linux / stable-aarch64-gnu
+          - linux / beta
+          - macOS / stable
+          - windows / stable-x86_64-msvc
+          - windows / stable-i686-msvc
+          - windows / stable-aarch64-msvc
+          - windows / stable-x86_64-gnu
+          - windows / stable-i686-gnu
+          - "feat.: default-tls disabled"
+          - "feat.: rustls"
+          - "feat.: rustls-no-provider"
+          - "feat.: native-tls"
+          - "feat.: default-tls and native-tls"
+          - "feat.: rustls and rustls-no-provider"
+          - "feat.: cookies"
+          - "feat.: blocking"
+          - "feat.: blocking only"
+          - "feat.: gzip"
+          - "feat.: brotli"
+          - "feat.: deflate"
+          - "feat.: query"
+          - "feat.: form"
+          - "feat.: json"
+          - "feat.: multipart"
+          - "feat.: stream"
+          - "feat.: socks/default-tls"
+          - "feat.: socks/native-tls"
+          - "feat.: hickory-dns"
+        include:
+          - name: linux / stable
+          - name: linux / stable-aarch64-gnu
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - name: linux / beta
+            rust: beta
+          - name: macOS / stable
+            os: macOS-latest
+          - name: windows / stable-x86_64-msvc
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            features: "--features blocking,gzip,brotli,zstd,deflate,query,form,json,multipart,stream"
+            aws_lc_sys_prebuilt_nasm: 1
+          - name: windows / stable-i686-msvc
+            os: windows-latest
+            target: i686-pc-windows-msvc
+            features: "--features blocking,gzip,brotli,zstd,deflate,query,form,json,multipart,stream"
+            aws_lc_sys_prebuilt_nasm: 1
+          - name: windows / stable-aarch64-msvc
+            os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            features: "--features blocking,gzip,brotli,zstd,deflate,query,form,json,multipart,stream"
+            aws_lc_sys_prebuilt_nasm: 1
+          - name: windows / stable-x86_64-gnu
+            os: windows-latest
+            rust: stable-x86_64-pc-windows-gnu
+            target: x86_64-pc-windows-gnu
+            features: "--features blocking,gzip,brotli,zstd,deflate,query,form,json,multipart,stream"
+            package_name: mingw-w64-x86_64-gcc
+            mingw64_path: "C:\\msys64\\mingw64\\bin"
+            aws_lc_sys_prebuilt_nasm: 1
+          - name: windows / stable-i686-gnu
+            os: windows-latest
+            rust: stable-i686-pc-windows-gnu
+            target: i686-pc-windows-gnu
+            features: "--no-default-features --features blocking,gzip,brotli,zstd,deflate,query,form,json,multipart,stream,native-tls,http2"
+            package_name: mingw-w64-i686-gcc
+            mingw64_path: "C:\\msys64\\mingw32\\bin"
+          - name: "feat.: default-tls disabled"
+            features: "--no-default-features"
+          - name: "feat.: rustls"
+            features: "--no-default-features --features rustls"
+          - name: "feat.: rustls-no-provider"
+            features: "--no-default-features --features rustls-no-provider"
+          - name: "feat.: native-tls"
+            features: "--features native-tls"
+          - name: "feat.: rustls and rustls-no-provider"
+            features: "--features rustls,rustls-no-provider"
+          - name: "feat.: default-tls and native-tls"
+            features: "--features native-tls"
+          - name: "feat.: cookies"
+            features: "--features cookies"
+          - name: "feat.: blocking"
+            features: "--features blocking"
+          - name: "feat.: blocking only"
+            features: "--no-default-features --features blocking"
+          - name: "feat.: gzip"
+            features: "--features gzip,stream"
+          - name: "feat.: brotli"
+            features: "--features brotli,stream"
+          - name: "feat.: zstd"
+            features: "--features zstd,stream"
+          - name: "feat.: deflate"
+            features: "--features deflate,stream"
+          - name: "feat.: query"
+            features: "--features query"
+          - name: "feat.: form"
+            features: "--features form"
+          - name: "feat.: json"
+            features: "--features json"
+          - name: "feat.: multipart"
+            features: "--features multipart"
+          - name: "feat.: stream"
+            features: "--features stream"
+          - name: "feat.: socks/default-tls"
+            features: "--features socks"
+          - name: "feat.: socks/native-tls"
+            features: "--features socks,native-tls"
+          - name: "feat.: hickory-dns"
+            features: "--features hickory-dns"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - name: Install rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust || 'stable' }}
+          targets: ${{ matrix.target }}
+      - name: Show commit
+        run: git rev-parse HEAD
+        shell: bash
+      - name: Add mingw-w64 to path for i686-gnu
+        run: |
+          echo "${{ matrix.mingw64_path }}" >> $GITHUB_PATH
+          echo "C:\msys64\usr\bin" >> $GITHUB_PATH
+        if: matrix.mingw64_path
+        shell: bash
+      - name: Install x86_64 Clang & NASM
+        if: ${{ matrix.target == 'x86_64-pc-windows-gnu' }}
+        run: pacman.exe -Sy --noconfirm mingw-w64-x86_64-clang mingw-w64-x86_64-nasm
+        shell: bash
+      - name: Add libclang to the environment for windows x86_64-gnu
+        run: echo "LIBCLANG_PATH=C:\msys64\mingw64\bin" >> $env:GITHUB_ENV
+        if: ${{ matrix.target == 'x86_64-pc-windows-gnu' }}
+        shell: bash
+      - name: Update gcc
+        if: matrix.package_name
+        run: pacman.exe -Sy --noconfirm ${{ matrix.package_name }}
+      - name: Create Cargo.lock
+        run: cargo update
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - name: Run tests
+        if: ${{ !cancelled() }}
+        run: |
+          set -euxo pipefail
+          cargo nextest run --no-fail-fast --locked --workspace ${{ matrix.features }} ${{ matrix.test-features }}
+        shell: bash
+      - name: Run doc tests
+        if: ${{ !cancelled() }}
+        run: |
+          set -euxo pipefail
+          cargo test --locked --workspace --doc ${{ matrix.features }} ${{ matrix.test-features }}
+        shell: bash
+
+  features:
+    name: features
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-hack
+        uses: taiki-e/install-action@cargo-hack
+      - uses: Swatinem/rust-cache@v2
+      - name: check --feature-powerset
+        if: ${{ !cancelled() }}
+        run: cargo hack --no-dev-deps check --feature-powerset --depth 2 --skip http3,__tls,__rustls,__rustls-aws-lc-rs,native-tls-vendored,trust-dns
+        env:
+          RUSTFLAGS: "-D dead_code -D unused_imports"
+
+  unstable:
+    name: "unstable features"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - name: Install rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 'stable'
+      - name: Check
+        if: ${{ !cancelled() }}
+        run: cargo test --no-fail-fast --features http3,stream
+        env:
+          RUSTFLAGS: --cfg reqwest_unstable
+          RUSTDOCFLAGS: --cfg reqwest_unstable
+
+  docs:
+    name: Docs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Check documentation
+        if: ${{ !cancelled() }}
+        env:
+          RUSTDOCFLAGS: --cfg reqwest_unstable -D warnings
+        run: cargo doc --no-deps --document-private-items --all-features
+
+  nightly:
+    name: linux / nightly
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - name: Install rust
+        uses: dtolnay/rust-toolchain@nightly
+      - name: Check minimal versions
+        if: ${{ !cancelled() }}
+        env:
+          RUSTFLAGS: --cfg reqwest_unstable
+        run: |
+          cargo clean
+          cargo update -Z minimal-versions
+          cargo update -p prefix-trie --precise 0.8.4
+          cargo check
+          cargo check --all-features
+
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Resolve MSRV aware dependencies
+        run: |
+          cargo update
+          cargo update yoke-derive --precise 0.8.2
+        env:
+          CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS: fallback
+      - name: Get MSRV package metadata
+        id: metadata
+        run: cargo metadata --no-deps --format-version 1 | jq -r '"msrv=" + .packages[0].rust_version' >> $GITHUB_OUTPUT
+      - name: Install rust (${{ steps.metadata.outputs.msrv }})
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.metadata.outputs.msrv }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Check
+        if: ${{ !cancelled() }}
+        run: cargo check
+
+  android:
+    name: Android
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - name: Install rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          target: aarch64-linux-android
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk
+      - name: Build
+        if: ${{ !cancelled() }}
+        run: cargo ndk --target aarch64-linux-android build
+
+  wasm:
+    name: WASM
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - name: Install rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Check
+        if: ${{ !cancelled() }}
+        run: cargo check --target wasm32-unknown-unknown
+      - name: Check cookies
+        if: ${{ !cancelled() }}
+        run: cargo check --target wasm32-unknown-unknown --features cookies
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+      - name: Wasm-pack test firefox
+        if: ${{ !cancelled() }}
+        run: wasm-pack test --headless --firefox
+      - name: Wasm-pack test chrome
+        if: ${{ !cancelled() }}
+        run: wasm-pack test --headless --chrome
